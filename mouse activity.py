@@ -1,116 +1,141 @@
-import cv2
-import time
-import threading
-from pynput import mouse
+from pynput import mouse, keyboard
+import pygetwindow as gw
+import pyautogui
+import pytesseract
 from datetime import datetime
-import mss
-import numpy as np
+import threading
+import os
+import time
+from PIL import Image
 
-log_file = "D:/SOP_log.txt"
-video_file = "D:/screen_record.avi"
+# ----------- Configuration ------------
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+LOG_PATH = "D:/user_activity_log.txt"
+SNAPSHOT_FOLDER = "D:/button_snapshots"
+os.makedirs(SNAPSHOT_FOLDER, exist_ok=True)
 
-# ---------------------- Mouse Activity Logger ----------------------
+# ----------- Global Variables ------------
+typed_text_buffer = ""
+last_window = None
+step_counter = 1
+step_lock = threading.Lock()
+stop_flag = threading.Event()
 
-mouse_log = []
+# ----------- Utility Functions ------------
+def write_log_step(website, clicked=None, typed=None, screenshot_note=None):
+    global step_counter
+    with step_lock:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"\nStep {step_counter} @ {timestamp}\nWebsite Active: {website}"
+        if clicked:
+            log_entry += f"\nClicked on Button/Link: {clicked}"
+        if typed:
+            log_entry += f"\nUser Typed: {typed}"
+        if screenshot_note:
+            log_entry += f"\nScreenshot: {screenshot_note}"
+        log_entry += "\n"
 
+        step_counter += 1
+        print(log_entry.strip())
+        with open(LOG_PATH, "a", encoding='utf-8') as f:
+            f.write(log_entry)
+
+def get_active_window_title():
+    try:
+        win = gw.getActiveWindow()
+        return win.title if win else "Unknown Window"
+    except:
+        return "Unknown Window"
+
+def preprocess_image(img):
+    img = img.resize((img.width * 2, img.height * 2))
+    img = img.convert('L')
+    img = img.point(lambda x: 0 if x < 150 else 255, '1')
+    return img
+
+def get_text_near_click(x, y, radius=200):
+    screenshot = pyautogui.screenshot()
+    region = (
+        max(0, x - radius),
+        max(0, y - radius),
+        min(screenshot.width, x + radius),
+        min(screenshot.height, y + radius)
+    )
+    cropped = screenshot.crop(region)
+    cropped = preprocess_image(cropped)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    img_path = os.path.join(SNAPSHOT_FOLDER, f"snap_{timestamp}.png")
+    cropped.save(img_path)
+
+    text = pytesseract.image_to_string(cropped).strip()
+    return text if text else "No readable text"
+
+def take_full_screenshot():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join(SNAPSHOT_FOLDER, f"F10_screenshot_{timestamp}.png")
+    pyautogui.screenshot(filepath)
+    print(f"Screenshot saved: {filepath}")
+    write_log_step(get_active_window_title(), screenshot_note=f"Saved at {filepath}")
+
+# ----------- Event Handlers ------------
 def on_click(x, y, button, pressed):
     if pressed:
-        action = f"{datetime.now()} - Mouse clicked at ({x}, {y}) with {button}"
-        print(action)
-        mouse_log.append(action)
+        window_title = get_active_window_title()
+        detected_text = get_text_near_click(x, y)
+        if detected_text != "No readable text":
+            write_log_step(window_title, clicked=detected_text)
+        else:
+            write_log_step(window_title, clicked="(no text detected near click)")
 
-def on_scroll(x, y, dx, dy):
-    action = f"{datetime.now()} - Scrolled at ({x}, {y}) by ({dx}, {dy})"
-    print(action)
-    mouse_log.append(action)
+def on_press(key):
+    global typed_text_buffer, last_window
+    try:
+        if key == keyboard.Key.f10:
+            take_full_screenshot()
+            return
+        elif key == keyboard.Key.f9:
+            stop_flag.set()
+            write_log_step(get_active_window_title(), screenshot_note="Monitoring stopped by user via F9")
+            return
 
-def on_move(x, y):
-    action = f"{datetime.now()} - Mouse moved to ({x}, {y})"
-    print(action)
-    mouse_log.append(action)
+        active_win = get_active_window_title()
+        if last_window != active_win:
+            typed_text_buffer = ""
+            last_window = active_win
 
-def start_mouse_listener():
-    with mouse.Listener(on_click=on_click, on_scroll=on_scroll, on_move=on_move) as listener:
-        listener.join()
+        if hasattr(key, 'char') and key.char is not None:
+            typed_text_buffer += key.char
+        elif key == keyboard.Key.space:
+            typed_text_buffer += ' '
+        elif key == keyboard.Key.enter:
+            if typed_text_buffer.strip():
+                write_log_step(active_win, typed=typed_text_buffer.strip())
+            typed_text_buffer = ""
+        elif key == keyboard.Key.backspace:
+            typed_text_buffer = typed_text_buffer[:-1]
+    except Exception as e:
+        write_log_step("Unknown Window", screenshot_note=f"[ERROR] Keyboard capture failed: {e}")
 
-# ---------------------- Screen Recorder ----------------------
+# ----------- Start Listeners ------------
+def start_listeners():
+    mouse_listener = mouse.Listener(on_click=on_click)
+    keyboard_listener = keyboard.Listener(on_press=on_press)
+    mouse_listener.start()
+    keyboard_listener.start()
 
-def record_screen(duration=30, fps=10):
-    with mss.mss() as sct:
-        monitor = sct.monitors[1]  # Full screen
-        width, height = monitor["width"], monitor["height"]
+    while not stop_flag.is_set():
+        time.sleep(0.5)
 
-        fourcc = cv2.VideoWriter_fourcc(*"XVID")
-        out = cv2.VideoWriter(video_file, fourcc, fps, (width, height))
+    mouse_listener.stop()
+    keyboard_listener.stop()
 
-        start_time = time.time()
-        while time.time() - start_time < duration:
-            img = np.array(sct.grab(monitor))
-            frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            out.write(frame)
-            time.sleep(1 / fps)
+# ----------- Main Execution ------------
+threading.Thread(target=start_listeners, daemon=True).start()
+write_log_step("System", screenshot_note="=== Structured User Activity Monitoring Started ===")
 
-        out.release()
-
-# ---------------------- Save Mouse Logs ----------------------
-
-def save_logs():
-    with open(log_file, "w") as f:
-        f.write("Mouse Activity Log:\n\n")
-        for log in mouse_log:
-            f.write(log + "\n")
-
-# ---------------------- Analyze Screen Recording (Basic) ----------------------
-
-def analyze_screen_video():
-    cap = cv2.VideoCapture(video_file)
-    prev_frame = None
-    event_logs = []
-    i = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        i += 1
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-        if prev_frame is None:
-            prev_frame = gray
-            continue
-
-        delta_frame = cv2.absdiff(prev_frame, gray)
-        thresh = cv2.threshold(delta_frame, 25, 255, cv2.THRESH_BINARY)[1]
-        non_zero_count = np.count_nonzero(thresh)
-
-        if non_zero_count > 50000:
-            timestamp = i / 10  # Assuming 10 fps
-            event_logs.append(f"{timestamp:.2f}s - Significant activity (mouse movement or click)")
-
-        prev_frame = gray
-
-    cap.release()
-
-    with open("D:/screen_analysis.txt", "w") as f:
-        f.write("Screen Recording Analysis:\n\n")
-        for log in event_logs:
-            f.write(log + "\n")
-
-# ---------------------- Main Runner ----------------------
-
-if __name__ == "__main__":
-    print("Recording started. Press Ctrl+C to stop early.")
-
-    mouse_thread = threading.Thread(target=start_mouse_listener)
-    mouse_thread.daemon = True
-    mouse_thread.start()
-
-    # Record screen for 30 seconds
-    record_screen(duration=30)
-
-    # Save logs after screen record ends
-    save_logs()
-    analyze_screen_video()
-
-    print("Activity tracking complete. Logs and analysis saved.")
+try:
+    while not stop_flag.is_set():
+        time.sleep(1)
+except KeyboardInterrupt:
+    write_log_step("System", screenshot_note="Monitoring stopped by keyboard interrupt.")
